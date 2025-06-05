@@ -1,5 +1,4 @@
-# Save as ~/.config/fish/functions/ai.fish
-
+# Enhanced AI Fish Function with execution fixes and memory
 function ai
     if not set -q argv
         echo "Usage: ai <your query>"
@@ -8,25 +7,59 @@ function ai
 
     set -l query_string "$argv"
     set -l current_dir "$PWD"
-    set -l backend_script (status dirname)"/../scripts/ai_backend.py"
+    set -l backend_script ~/.config/fish/scripts/ai_backend.py
+    
+    set -l temp_dir "$HOME/.cache"
+    if not test -d "$temp_dir"
+        mkdir -p "$temp_dir"
+    end
+    set -l ai_output_file "$temp_dir/ai_last_output"
+    set -l ai_context_file "$temp_dir/ai_deep_context"
 
     if not test -f "$backend_script"
-        echo -e "\033[0;31m❌ AI backend not found at '$backend_script'\033[0m"
+        echo -e "\033[0;31m❌ AI backend not found. Run setup again.\033[0m"
         return 1
     end
 
-    echo -n -e "\033[0;36m🤖 Processing...\033[0m"
+    echo -n -e "\033[0;36m🤖 Analyzing environment...\033[0m"
     
-    # Get recent command history and output
-    set -l context_data ""
-    if test -f /tmp/ai_last_output
-        set context_data (cat /tmp/ai_last_output)
+    # Comprehensive context gathering
+    set -l deep_context ""
+    set -l dir_structure (find . -maxdepth 2 -type f -exec ls -la {} \; 2>/dev/null | head -30)
+    set -l git_repos (find . -maxdepth 2 -name ".git" -type d 2>/dev/null | sed 's|/.git||')
+    set -l executables (find . -maxdepth 1 -type f -executable 2>/dev/null)
+    set -l source_files (find . -maxdepth 1 \( -name "*.c" -o -name "*.cpp" -o -name "*.py" -o -name "*.sh" -o -name "*.js" -o -name "*.go" -o -name "*.rs" \) 2>/dev/null)
+    
+    # System info
+    set -l compilers ""
+    for compiler in gcc g++ clang python3 node rustc go javac
+        if command -v $compiler >/dev/null 2>&1
+            set compilers "$compilers $compiler"
+        end
     end
     
-    set -l response_json
-    set -l stderr_tmp (mktemp)
+    set -l recent_history (history --max=3 | string join "\n")
+    set -l context_data ""
+    if test -f "$ai_output_file"
+        set context_data (cat "$ai_output_file")
+    end
+    
+    set deep_context "DIR_STRUCTURE: $dir_structure
+GIT_REPOS: $git_repos
+EXECUTABLES: $executables
+SOURCE_FILES: $source_files
+COMPILERS: $compilers
+RECENT_HISTORY: $recent_history
+PWD: $PWD"
+    
+    printf '%s\n%s' "$deep_context" "$context_data" > "$ai_context_file"
 
-    if command python3 "$backend_script" --query "$query_string" --cwd "$current_dir" --context-data "$context_data" 2> "$stderr_tmp" | read -lz response_json
+    echo -e "\r\033[K\033[0;36m🤖 Processing...\033[0m"
+    
+    set -l response_json
+    set -l stderr_tmp (mktemp -p "$temp_dir")
+
+    if command python3 "$backend_script" --query "$query_string" --cwd "$current_dir" --context-file "$ai_context_file" 2> "$stderr_tmp" | read -lz response_json
         # Success
     else
         echo -e "\r\033[K\033[0;31m❌ AI Backend Error\033[0m"
@@ -36,14 +69,14 @@ function ai
     end
     rm -f "$stderr_tmp"
 
-    echo -e "\r\033[K" # Clear processing line
+    echo -e "\r\033[K"
 
     if test -z "$response_json"
         echo -e "\033[0;31m❌ Empty response\033[0m"
         return 1
     end
 
-    # Parse and execute actions
+    # Parse and execute
     set -l num_actions 0
     if command -v jq >/dev/null 2>&1
         set num_actions (echo "$response_json" | jq 'length')
@@ -57,8 +90,7 @@ function ai
        return 0
     end
 
-    # Execute actions
-    set -l last_output ""
+    # Execute actions with better handling
     set -l action_outputs ""
     
     for i in (seq 0 (math $num_actions - 1))
@@ -68,7 +100,6 @@ function ai
         set -l command (echo "$action" | jq -r ".command // \"\"")
         set -l path (echo "$action" | jq -r ".path // \"\"")
         set -l auto_exec (echo "$action" | jq -r ".auto_execute // true")
-        set -l use_output (echo "$action" | jq -r ".use_output_for_next // false")
         
         switch "$type"
             case "text"
@@ -83,45 +114,103 @@ function ai
                 if test -n "$command"
                     echo -e "\033[0;93m💻 $command\033[0m"
                     
-                    # Check for dangerous commands
-                    if string match -qr "(rm -rf|format|shutdown|reboot)" "$command"
-                        read -P "⚠️ Execute dangerous command? [y/N] " -l confirm
+                    # Safety check
+                    if string match -qr "(rm -rf|format|shutdown|reboot|dd if=)" "$command"
+                        read -P "⚠️ Execute potentially dangerous command? [y/N] " -l confirm
                         if not string match -qi "y" "$confirm"
-                            echo -e "\033[0;90m⏭️ Skipped\033[0m"
-                            set action_outputs "$action_outputs\nCMD SKIPPED: $command"
+                            echo -e "\033[0;90m⏭️ Skipped dangerous command\033[0m"
                             continue
                         end
                     else if test "$auto_exec" = "false"
-                        read -P "Execute? [y/N] " -l confirm
-                        if not string match -qi "y" "$confirm"
-                            echo -e "\033[0;90m⏭️ Skipped\033[0m"
-                            set action_outputs "$action_outputs\nCMD SKIPPED: $command"
+                        read -P "Execute? [Y/n] " -l confirm
+                        if string match -qi "n" "$confirm"
+                            echo -e "\033[0;90m⏭️ Skipped by user\033[0m"
                             continue
                         end
                     end
                     
-                    # Execute and capture output
-                    set -l output_file (mktemp)
-                    set -l cmd_start_time (date +%s)
+                    # Enhanced execution with proper output handling
+                    set -l output_file (mktemp -p "$temp_dir")
+                    set -l timing_start (date +%s)
                     
-                    eval "$command" 2>&1 | tee "$output_file"
+                    # Use fish for better execution
+                    begin
+                        eval "$command"
+                    end 2>&1 | tee "$output_file"
                     set -l status_code $status
+                    
+                    set -l timing_end (date +%s)
+                    set -l duration (math $timing_end - $timing_start)
                     set -l cmd_output (cat "$output_file")
-                    
-                    if test "$use_output" = "true"
-                        set last_output "$cmd_output"
-                    end
-                    
-                    # Store output for next AI call
-                    set action_outputs "$action_outputs\nCMD: $command\nOUTPUT: $cmd_output\nEXIT_CODE: $status_code"
-                    
                     rm -f "$output_file"
                     
                     if test $status_code -eq 0
-                        echo -e "\033[0;32m✅ Success\033[0m"
+                        echo -e "\033[0;32m✅ Success ($duration s)\033[0m"
                     else
-                        echo -e "\033[0;31m❌ Failed (exit $status_code)\033[0m"
-                        _ai_fix_error "$command" $status_code "$cmd_output"
+                        echo -e "\033[0;31m❌ Failed: exit $status_code ($duration s)\033[0m"
+                    end
+                    
+                    set action_outputs "$action_outputs\nCMD: $command\nSTATUS: $status_code\nOUTPUT: $cmd_output"
+                end
+                
+            case "run"
+                # New enhanced run action for GUI/interactive programs
+                set -l executable (echo "$action" | jq -r ".executable")
+                set -l args (echo "$action" | jq -r ".args // \"\"")
+                set -l background (echo "$action" | jq -r ".background // false")
+                
+                if test -n "$executable"
+                    echo -e "\033[0;95m🚀 Running: $executable $args\033[0m"
+                    
+                    if test "$background" = "true"
+                        # Run in background for GUI apps
+                        nohup $executable $args > /dev/null 2>&1 &
+                        set -l pid $last_pid
+                        echo -e "\033[0;32m✅ Started in background (PID: $pid)\033[0m"
+                        set action_outputs "$action_outputs\nBACKGROUND_RUN: $executable (PID: $pid)"
+                    else
+                        # Run interactively for terminal programs
+                        if test -x "$executable"
+                            $executable $args
+                            set -l status_code $status
+                            if test $status_code -eq 0
+                                echo -e "\033[0;32m✅ Program completed\033[0m"
+                            else
+                                echo -e "\033[0;31m❌ Program exited with code $status_code\033[0m"
+                            end
+                            set action_outputs "$action_outputs\nRUN: $executable\nSTATUS: $status_code"
+                        else
+                            echo -e "\033[0;31m❌ File not executable: $executable\033[0m"
+                        end
+                    end
+                end
+                
+            case "compile_run"
+                set -l source_file (echo "$action" | jq -r ".source")
+                set -l compiler_cmd (echo "$action" | jq -r ".compile_command")
+                set -l run_cmd (echo "$action" | jq -r ".run_command // \"\"")
+                
+                if test -n "$source_file" && test -f "$source_file"
+                    echo -e "\033[0;94m🔨 Compiling $source_file\033[0m"
+                    echo -e "\033[0;93m💻 $compiler_cmd\033[0m"
+                    
+                    eval "$compiler_cmd"
+                    set -l compile_status $status
+                    
+                    if test $compile_status -eq 0
+                        echo -e "\033[0;32m✅ Compilation successful\033[0m"
+                        
+                        if test -n "$run_cmd"
+                            echo -e "\033[0;95m🚀 Running compiled program\033[0m"
+                            read -P "Run? [Y/n] " -l run_confirm
+                            if not string match -qi "n" "$run_confirm"
+                                eval "$run_cmd"
+                                set -l run_status $status
+                                set action_outputs "$action_outputs\nCOMPILE_RUN: $source_file\nRUN_STATUS: $run_status"
+                            end
+                        end
+                    else
+                        echo -e "\033[0;31m❌ Compilation failed\033[0m"
                     end
                 end
                 
@@ -129,71 +218,19 @@ function ai
                 if test -n "$path"
                     echo -e "\033[0;94m📄 Writing: $path\033[0m"
                     
-                    # Create parent directory
                     set -l parent_dir (dirname "$path")
                     if test "$parent_dir" != "." && not test -d "$parent_dir"
-                        if mkdir -p "$parent_dir" 2>/dev/null
-                            echo -e "\033[0;90m📁 Created directory: $parent_dir\033[0m"
-                        else
-                            echo -e "\033[0;33m⚠️ Creating directory with sudo...\033[0m"
-                            if sudo mkdir -p "$parent_dir" 2>/dev/null
-                                echo -e "\033[0;90m📁 Created directory with sudo: $parent_dir\033[0m"
-                            else
-                                echo -e "\033[0;31m❌ Failed to create directory\033[0m"
-                                set action_outputs "$action_outputs\nFILE_WRITE_FAILED: $path (directory creation failed)"
-                                continue
-                            end
-                        end
+                        mkdir -p "$parent_dir" 2>/dev/null
                     end
                     
-                    # Decode content properly (handle newlines)
-                    set -l decoded_content (echo "$content" | sed 's/\\n/\n/g' | sed 's/\\t/\t/g')
+                    set -l decoded_content (printf '%b' "$content")
                     
-                    # Write file with proper error handling
                     if printf '%s' "$decoded_content" > "$path" 2>/dev/null
-                        echo -e "\033[0;32m✅ File written successfully\033[0m"
                         set -l file_size (wc -c < "$path" 2>/dev/null || echo "unknown")
-                        set action_outputs "$action_outputs\nFILE_WRITTEN: $path ($file_size bytes)"
+                        echo -e "\033[0;32m✅ File written ($file_size bytes)\033[0m"
+                        set action_outputs "$action_outputs\nFILE_WRITTEN: $path"
                     else
-                        echo -e "\033[0;33m⚠️ Permission denied, trying with sudo...\033[0m"
-                        if printf '%s' "$decoded_content" | sudo tee "$path" >/dev/null 2>/dev/null
-                            echo -e "\033[0;32m✅ File written with elevated permissions\033[0m"
-                            set -l file_size (wc -c < "$path" 2>/dev/null || echo "unknown")
-                            set action_outputs "$action_outputs\nFILE_WRITTEN_SUDO: $path ($file_size bytes)"
-                        else
-                            echo -e "\033[0;31m❌ Failed to write file\033[0m"
-                            set action_outputs "$action_outputs\nFILE_WRITE_FAILED: $path (permission error)"
-                        end
-                    end
-                end
-                
-            case "config"
-                set -l expanded_path (string replace '~' "$HOME" "$path")
-                echo -e "\033[0;95m⚙️ Configuring: $expanded_path\033[0m"
-                
-                # Create backup
-                if test -f "$expanded_path"
-                    set -l backup_path "$expanded_path.backup."(date +%s)
-                    if cp "$expanded_path" "$backup_path" 2>/dev/null
-                        echo -e "\033[0;90m💾 Backup created: $backup_path\033[0m"
-                    end
-                end
-                
-                # Create parent directory
-                set -l parent_dir (dirname "$expanded_path")
-                mkdir -p "$parent_dir" 2>/dev/null
-                
-                # Append to config
-                set -l append_content (echo "$action" | jq -r ".append // \"\"")
-                if test -n "$append_content"
-                    set -l decoded_append (echo "$append_content" | sed 's/\\n/\n/g')
-                    
-                    if printf '%s\n' "$decoded_append" >> "$expanded_path" 2>/dev/null
-                        echo -e "\033[0;32m✅ Configuration updated\033[0m"
-                        set action_outputs "$action_outputs\nCONFIG_UPDATED: $expanded_path"
-                    else
-                        echo -e "\033[0;31m❌ Failed to update config (permission denied)\033[0m"
-                        set action_outputs "$action_outputs\nCONFIG_FAILED: $expanded_path (permission error)"
+                        echo -e "\033[0;31m❌ Failed to write file\033[0m"
                     end
                 end
                 
@@ -202,56 +239,44 @@ function ai
                 set -l manager (echo "$action" | jq -r ".manager // \"pkg\"")
                 
                 if test -n "$packages"
-                    echo -e "\033[0;92m📦 Installing: $packages\033[0m"
-                    set -l install_output ""
+                    echo -e "\033[0;92m📦 Installing with $manager: $packages\033[0m"
                     for package in $packages
-                        set -l pkg_output_file (mktemp)
-                        eval "$manager install -y $package" 2>&1 | tee "$pkg_output_file"
-                        set -l pkg_status $status
-                        set -l pkg_out (cat "$pkg_output_file")
-                        rm -f "$pkg_output_file"
-                        
-                        set install_output "$install_output\nPACKAGE: $package\nSTATUS: $pkg_status\nOUTPUT: $pkg_out"
+                        echo -e "\033[0;90m  Installing $package...\033[0m"
+                        eval "$manager install -y $package"
+                        if test $status -eq 0
+                            echo -e "\033[0;32m  ✅ $package installed\033[0m"
+                        else
+                            echo -e "\033[0;31m  ❌ $package failed\033[0m"
+                        end
                     end
-                    set action_outputs "$action_outputs\nINSTALL_RESULTS: $install_output"
                 end
         end
     end
     
-    # Save all action outputs for next AI call
-    printf '%s' "$action_outputs" > /tmp/ai_last_output
+    # Save context for next call
+    set -l full_context "$action_outputs\nTIMESTAMP: "(date)
+    printf '%s' "$full_context" > "$ai_output_file"
+    printf '%s\n\nLAST_RESULTS:\n%s' "$deep_context" "$full_context" > "$ai_context_file"
 end
 
-# Quick error fix function with output context
-function _ai_fix_error
-    set -l cmd "$argv[1]"
-    set -l code "$argv[2]"
-    set -l output "$argv[3]"
+# Memory function
+function airem --description "Store information for AI to remember"
+    set -l temp_dir "$HOME/.cache"
+    set -l memory_file "$temp_dir/ai_memory.txt"
     
-    echo -e "\033[0;93m🔧 Analyzing error...\033[0m"
-    set -l fix_query "Command '$cmd' failed with exit code $code. Output: $output. Provide quick fix."
-    
-    set -l fix (python3 (status dirname)"/../scripts/ai_backend.py" --query "$fix_query" --cwd "$PWD" --fix-mode 2>/dev/null)
-    if test -n "$fix"
-        echo -e "\033[0;93m💡 Suggestion: $fix\033[0m"
+    if not set -q argv
+        echo "Usage: airem <information to remember>"
+        if test -f "$memory_file"
+            echo -e "\n\033[0;96mCurrent memories:\033[0m"
+            cat "$memory_file"
+        end
+        return 1
     end
-end
-
-# Auto-completion function
-function _ai_complete
-    set -l current_token (commandline -t)
-    set -l suggestions_file /tmp/ai_suggestions
     
-    # Generate suggestions based on current context
-    python3 (status dirname)"/../scripts/ai_backend.py" --query "suggest completions for: $current_token" --cwd "$PWD" --complete-mode > "$suggestions_file" 2>/dev/null
-    
-    if test -f "$suggestions_file"
-        cat "$suggestions_file"
-    end
+    set -l memory_entry "[$(date)] $argv"
+    echo "$memory_entry" >> "$memory_file"
+    echo -e "\033[0;32m💾 Remembered: $argv\033[0m"
 end
-
-# Bind Ctrl+Space for AI completions
-bind \c\  '_ai_complete'
 
 # Shortcuts
 function aia --description "AI with auto-execute"
@@ -260,13 +285,30 @@ end
 
 function aif --description "AI fix last command"
     set -l last_cmd (history --max=1)
-    ai "fix command: $last_cmd"
+    ai "fix this failed command: $last_cmd"
 end
 
-function aic --description "AI with current context"
-    set -l context_info ""
-    if test -f /tmp/ai_last_output
-        set context_info "Previous context: "(cat /tmp/ai_last_output | tail -20)
+function aic --description "AI with full context"
+    set -l temp_dir "$HOME/.cache"
+    set -l memory_file "$temp_dir/ai_memory.txt"
+    set -l memory_context ""
+    if test -f "$memory_file"
+        set memory_context "MEMORIES: $(cat $memory_file)"
     end
-    ai "$argv. Context: $context_info"
+    ai "$argv. $memory_context"
+end
+
+function aix --description "AI execute programs"
+    ai "execute/run programs in current directory: $argv"
+end
+
+function aih --description "AI help"
+    echo -e "\033[0;96m🤖 AI Assistant Help\033[0m"
+    echo -e "\033[0;93mai <query>\033[0m     - Ask AI with context"
+    echo -e "\033[0;93maia <query>\033[0m    - AI with auto-execute"
+    echo -e "\033[0;93maif\033[0m           - Fix last failed command"
+    echo -e "\033[0;93maic <query>\033[0m   - AI with memory context"
+    echo -e "\033[0;93maix <query>\033[0m   - AI execute programs"
+    echo -e "\033[0;93mairem <info>\033[0m  - Store info for AI memory"
+    echo -e "\033[0;93maih\033[0m           - Show this help"
 end
